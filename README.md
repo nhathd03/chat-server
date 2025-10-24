@@ -3,7 +3,6 @@
 
 Simple C++ chat application, compatible with Windows and MacOS
 
----
 
 ## Features
 
@@ -17,6 +16,7 @@ Synchronization primitives like `std::mutex` and `std::shared_mutex` ensure safe
 
 ### Cross-Platform Networking
 On Windows, the app uses Winsock2 (`Ws2_32.lib`), while on macOS/Linux it can be adapted using the Berkeley sockets API.  
+
 
 
 ## Requirements
@@ -51,6 +51,7 @@ g++ -std=c++17 client.cpp -o client.exe
 -   Type `/quit` to disconnect
 -   Stop the server anytime using **Ctrl + C**
     
+
 
 ## Notes
 -   Default port: 3000
