@@ -3,6 +3,7 @@
 
 Simple C++ chat application, compatible with Windows and MacOS
 
+<br />
 
 ## Features
 
