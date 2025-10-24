@@ -1,5 +1,5 @@
+#if defined(_WIN32)
 #define _WIN32_WINNT 0x0600  
-
 #include <iostream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -14,9 +14,39 @@
 #include <memory>
 #include <signal.h>
 
-
 #pragma comment(lib, "Ws2_32.lib")
 constexpr const char* DEFAULT_PORT = "3000";
+
+#else
+#include <iostream>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <thread>
+#include <mutex>
+#include <shared_mutex>
+#include <vector>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <signal.h>
+#include <cstring>
+#include <fcntl.h>
+
+#define SOCKET int
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR (-1)
+#define SD_BOTH SHUT_RDWR
+#define closesocket close
+#define ioctlsocket ioctl
+#define ZeroMemory(b, s) memset(b, 0, s)
+constexpr const char* DEFAULT_PORT = "3000";
+
+#endif
+
 
 struct client_info {
     SOCKET socket;
@@ -152,7 +182,7 @@ void broadcast_message(SOCKET sock, char* message_to_send, int len) {
 void handle_client(std::shared_ptr<client_info> client) {
 
     // Send welcome message to all clients
-    std::string welcome_message = client->name + "----- has joined the chat. -----";
+    std::string welcome_message = "\n----- " + client->name + " has joined the chat. -----" + "\n";
     std::vector<char> welcome_message_to_send = build_message_buffer(welcome_message);
 
     broadcast_message(client->socket, welcome_message_to_send.data(), welcome_message_to_send.size());
@@ -164,7 +194,7 @@ void handle_client(std::shared_ptr<client_info> client) {
     while (running) {
         if (!receive_message(client->socket, incoming_message)) {
             // notify other clients on exit
-            std::string exit_message = client->name + " has left the chat.";
+            std::string exit_message = "\n----- " + client->name + " has left the chat. -----" + "\n";
             std::vector<char> exit_message_to_send = build_message_buffer(exit_message);
 
             broadcast_message(client->socket, exit_message_to_send.data(), exit_message_to_send.size());
@@ -228,20 +258,20 @@ SOCKET create_listening_socket(const char* port) {
     SOCKET listen_socket = socket(address_info->ai_family, address_info->ai_socktype, address_info->ai_protocol);
     
     if (listen_socket == INVALID_SOCKET) {
-        std::cerr << "socket creation failed: " << WSAGetLastError() << "\n";
+        std::cerr << "socket creation failed\n";
         return INVALID_SOCKET;
     }
     
     // Bind socket
     if (bind(listen_socket, address_info->ai_addr, static_cast<int>(address_info->ai_addrlen)) == SOCKET_ERROR) {
-        std::cerr << "bind failed: " << WSAGetLastError() << "\n";
+        std::cerr << "bind failed\n";
         closesocket(listen_socket);
         return INVALID_SOCKET;
     }
     
     // Listen for connections
     if (listen(listen_socket, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "listen failed: " << WSAGetLastError() << "\n";
+        std::cerr << "listen failed\n";
         closesocket(listen_socket);
         return INVALID_SOCKET;
     }
@@ -257,103 +287,93 @@ void signal_handler(int) {
 
 
 int main() {
+#if defined(_WIN32)
     WSADATA wsa_data;
-
     int i_result;
-    
-    std::cout << "yo" << "\n";
-
-    // Initialize Winsock
     i_result = WSAStartup(MAKEWORD(2,2), &wsa_data);
-
     if (i_result != 0) {
         printf("WSAStartup failed: %d\n", i_result);
         return 1;                        
     }
+#endif
     
-    std::cout << "Chat Server v1.0" << "\n";
-    std::cout << "Initializing..." << "\n";
+    std::cout << "Chat Server v1.0\n";
+    std::cout << "Initializing...\n";
 
-    // create listening socket
     const SOCKET listen_socket = create_listening_socket(DEFAULT_PORT);
  
     if (listen_socket == INVALID_SOCKET) {
+#if defined(_WIN32)
         WSACleanup();
-        return 1;
-    }
-    
-    u_long mode = 1;  // 1 = non-blocking, 0 = blocking
-    if (ioctlsocket(listen_socket, FIONBIO, &mode) == SOCKET_ERROR) {
-        std::cerr << "Failed to set non-blocking mode: " << WSAGetLastError() << "\n";
-        closesocket(listen_socket);
-        WSACleanup();
+#endif
         return 1;
     }
 
+#if defined(_WIN32)
+    u_long mode = 1;  
+    ioctlsocket(listen_socket, FIONBIO, &mode);
+#else
+    int flags = fcntl(listen_socket, F_GETFL, 0);
+    fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK);
+#endif
+
     std::cout << "Server listening on port " << DEFAULT_PORT << "\n";
-    std::cout << "Waiting for connections..." << "\n";
+    std::cout << "Waiting for connections...\n";
 
     signal(SIGINT, signal_handler);
 
-    // constantly listen for a connection
     while (running) {
-
-        // Accept a client socket
         SOCKET client_socket = accept(listen_socket, NULL, NULL);
         if (client_socket == INVALID_SOCKET) {
+#if defined(_WIN32)
             int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                // No pending connections, sleep briefly and check running flag
+            if (err == WSAEWOULDBLOCK)
+#else
+            if (errno == EWOULDBLOCK || errno == EAGAIN)
+#endif
+            {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
-            std::cerr << "accept failed: " << err << "\n";
+            std::cerr << "accept failed\n";
             continue;
         }
 
+#if defined(_WIN32)
         u_long blocking = 0;
-        if(ioctlsocket(client_socket, FIONBIO, &blocking) == SOCKET_ERROR) {
-            std::cerr << "Failed to set blocking mode: " << WSAGetLastError() << "\n";
-            closesocket(listen_socket);
-            WSACleanup();
-            return 1;
-        }
+        ioctlsocket(client_socket, FIONBIO, &blocking);
+#else
+        int fl = fcntl(client_socket, F_GETFL, 0);
+        fcntl(client_socket, F_SETFL, fl & ~O_NONBLOCK);
+#endif
 
-        // Receiving the client's name:
-        // grab length of name
         uint32_t len_net;
         if (recv_all(client_socket, reinterpret_cast<char*>(&len_net), sizeof(len_net)) <= 0) {
-            printf("Error receiving message name: 1 %d\n", WSAGetLastError());
             closesocket(client_socket);
             continue;
         };
         
-        // use length to build name buffer
         uint32_t name_len = ntohl(len_net);
         if (name_len <= 0 || name_len > 20) { 
-            std::cerr << "Invalid name length: " << name_len << "\n";
             closesocket(client_socket);
             continue;
         }
         std::string name(name_len, '\0');
 
         if (recv_all(client_socket, &name[0], name_len) <= 0) {
-            printf("Error receiving message name: 2 %d\n", WSAGetLastError());
             closesocket(client_socket);
             continue;
         };
 
-        // get client IP and log in terminal
         sockaddr_in client_addr;
-        int addr_len = sizeof(client_addr);
+        socklen_t addr_len = sizeof(client_addr);
         getpeername(client_socket, (sockaddr*)&client_addr, &addr_len);              
 
-        char client_ip[INET_ADDRSTRLEN]; // 16 bytes
+        char client_ip[INET_ADDRSTRLEN]; 
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
         printf("Accepted Connection from: %s\n", client_ip);
 
-        // add new client to the list and create a thread for it
         {
              std::unique_lock<std::shared_mutex> write_lock(client_mutex);
 
@@ -373,12 +393,10 @@ int main() {
         }
     }
 
-    std::cout << "Server shutting down..." << "\n";
+    std::cout << "Server shutting down...\n";
 
-    // Wait for client threads to finish
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    // Force close all remaining clients
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex);
         for (auto& client : clients_list) {
@@ -388,12 +406,13 @@ int main() {
         clients_list.clear();
     }
 
-    // Clean up listening socket
     shutdown(listen_socket, SD_BOTH);
     closesocket(listen_socket);
+#if defined(_WIN32)
     WSACleanup();
+#endif
 
-    std::cout << "Server stopped.";
+    std::cout << "Server stopped.\n";
     
     return 0;
 }
