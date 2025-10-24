@@ -1,5 +1,5 @@
-#define _WIN32_WINNT 0x0600  
-
+#if defined(_WIN32)
+#define _WIN32_WINNT 0x0600
 #include <iostream>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -13,6 +13,43 @@
 
 #define DEFAULT_PORT "3000"
 #pragma comment(lib, "Ws2_32.lib")
+
+#else
+#include <iostream>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <termios.h>
+#include <string>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <vector>
+#include <cstring>
+#include <cstdio>
+
+#define SOCKET int
+#define INVALID_SOCKET (-1)
+#define SD_BOTH SHUT_RDWR
+#define closesocket close
+#define DEFAULT_PORT "3000"
+
+// emulate _getch() on POSIX
+int _getch() {
+    struct termios oldt, newt;
+    int ch;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    ch = getchar();
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    return ch;
+}
+#endif
+
 
 std::atomic<bool> running{true};
 std::mutex input_mutex;
@@ -60,7 +97,7 @@ SOCKET connect_to_addresses(addrinfo* result) {
             continue;
         }
 
-        if (connect(cand, ptr->ai_addr, (int)ptr->ai_addrlen) == SOCKET_ERROR) {
+        if (connect(cand, ptr->ai_addr, (int)ptr->ai_addrlen) < 0) {
             closesocket(cand);
             continue;
         }
@@ -91,7 +128,7 @@ std::string get_username() {
     while (true) {
         int ch = _getch();
         // if pressed enter, break
-        if (ch == '\r') {
+        if (ch == '\r' || ch == '\n') {
             if (!username.empty()) {
                 std::cout << "\n";
                 break;
@@ -100,7 +137,7 @@ std::string get_username() {
             std::cout << "Enter a username: " << std::flush;
         }
         // if backspace, backspace
-        else if (ch == 8) { 
+        else if (ch == 8 || ch == 127) { 
             if (!username.empty()) {
                 username.pop_back();
                 std::cout << "\b \b" << std::flush;
@@ -167,13 +204,13 @@ int send_all(SOCKET sock, char* buf, int len) {
  * and sends messages to the server. Runs until running becomes false.
  */
 void handle_user_input(SOCKET sock, std::string& username, std::string& current_input) {
-        std::cout << username << ": " << std::flush;
+        std::cout << "\n" << username << ": " << std::flush;
         while (running) {
             // Read from user
             int ch = _getch(); 
             
             // if pressed enter, send current_input
-            if (ch == '\r') {
+            if (ch == '\r' || ch == '\n') {
                 std::string message_copy;
                 {
                     std::lock_guard<std::mutex> write_lock(input_mutex);
@@ -193,7 +230,7 @@ void handle_user_input(SOCKET sock, std::string& username, std::string& current_
                 int bytes_sent = send_all(sock, message_to_send.data(), message_to_send.size());
 
                 if (bytes_sent != static_cast<int>(message_to_send.size())) {
-                    printf("Error sending message: %d\n", WSAGetLastError());
+                    printf("Error sending message\n");
                     running = false;
                     safe_close_socket(sock);
                     break; 
@@ -208,7 +245,7 @@ void handle_user_input(SOCKET sock, std::string& username, std::string& current_
             }
 
             // if backspace, backspace
-            else if (ch == 8) { 
+            else if (ch == 8 || ch == 127) { 
                 std::lock_guard<std::mutex> write_lock(input_mutex);
                 if (!current_input.empty()) {
                     current_input.pop_back();
@@ -262,7 +299,7 @@ void handle_recv(SOCKET sock, std::string& username, std::string& current_input 
             if (recv_all(sock, reinterpret_cast<char*>(&len_net), sizeof(len_net)) <= 0) {            
                 {
                     std::lock_guard<std::mutex> lock(input_mutex);
-                    std::cout << "\n" << "----- [Disconnected] -----" << "\n";
+                    std::cout << "\n\n" << "----- [Disconnected] -----" << "\n";
                 }
                 running = false;
                 safe_close_socket(sock);
@@ -283,7 +320,7 @@ void handle_recv(SOCKET sock, std::string& username, std::string& current_input 
             if (recv_all(sock, message.data(), len) <= 0) {
                 {
                     std::lock_guard<std::mutex> lock(input_mutex);
-                    std::cout << "\n" << "----- [Disconnected] -----" << "\n";
+                    std::cout << "\n\n" << "----- [Disconnected] -----" << "\n";
                 }
                 running = false;
                 safe_close_socket(sock);
@@ -317,21 +354,21 @@ int main(int argc, char* argv[]) {
     // get username
     std::string username = get_username();
 
-
+#ifdef _WIN32
     // Initialize Winsock
     WSADATA wsa_data;
-
-    int i_result;
-
-    i_result = WSAStartup(MAKEWORD(2,2), &wsa_data);
+    int i_result = WSAStartup(MAKEWORD(2,2), &wsa_data);
     if (i_result != 0) {
         printf("WSAStartup failed: %d\n", i_result);
         return 1;  
     }
+#else
+    int i_result = 0;
+#endif
 
     struct addrinfo *result = NULL, hints;
 
-    ZeroMemory(&hints, sizeof(hints));
+    memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
@@ -340,7 +377,9 @@ int main(int argc, char* argv[]) {
     i_result = getaddrinfo(argv[1], DEFAULT_PORT, &hints, &result);
     if (i_result != 0) {
         printf("getaddrinfo failed: %d\n", i_result);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -350,7 +389,9 @@ int main(int argc, char* argv[]) {
 
     if (connect_socket == INVALID_SOCKET) {
         printf("Unable to connect to server!\n");
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }          
 
@@ -360,9 +401,14 @@ int main(int argc, char* argv[]) {
     if (i_result != (int)username_to_send.size()) {  
         printf("Error setting name (sent %d/%zu bytes)\n", i_result, username_to_send.size());
         closesocket(connect_socket);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
+
+    std::cout << "\n" << "----- you joined the chat -----" << "\n";
+    std::cout << "\n" << "----- enter \"/quit\" to exit -----" << "\n";
 
     std::string current_input;
 
@@ -376,8 +422,8 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
     std::cout << "Quitting..." << "\n";
 
-
-
+#ifdef _WIN32
     WSACleanup();
+#endif
     return 0;
 }
