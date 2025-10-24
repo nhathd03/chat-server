@@ -16,31 +16,23 @@
 
 std::atomic<bool> running{true};
 std::mutex input_mutex;
-std::atomic<bool> shutdown_called{false};
 
-/**
- * @brief Safely shutdown a socket connection
- * @param sock The socket to shutdown
- * 
- * uses an atomic flag to ensure shutdown is called only once,
- * preventing multiple threads from closing the same socket simultaneously.
- *
- */
-void safe_shutdown(SOCKET sock) {
-    bool expected = false;
-    if (shutdown_called.compare_exchange_strong(expected, true)) {
-        shutdown(sock, SD_BOTH);
-        closesocket(sock);
+// avoids double close
+void safe_close_socket(SOCKET& s) {
+    if (s != INVALID_SOCKET) {
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+        s = INVALID_SOCKET;
     }
 }
 
-
 /**
- * @brief Attempt connection to resolved addresses with ipv4/ipv6 fallback
+ * @brief Attempt connection to resolved addresses with IPv4/IPv6 fallback
  * @param result Linked list of resolved addresses from getaddrinfo
  * @return Connected socket or INVALID_SOCKET on failure
  * 
- * Iterates through all resolved addresses and attempts to connect to each.
+ * Iterates through all resolved addresses, attempting connection to each.
+ * Supports both IPv4 and IPv6 addresses. Frees addrinfo structure before returning.
  */
 SOCKET connect_to_addresses(addrinfo* result) {
     SOCKET s = INVALID_SOCKET;
@@ -73,7 +65,7 @@ SOCKET connect_to_addresses(addrinfo* result) {
             continue;
         }
 
-        std::cout << "connected to " << str_buf << std::endl;
+        std::cout << "connected to " << str_buf << "\n";
         s = cand;
         break;
     }
@@ -85,6 +77,12 @@ SOCKET connect_to_addresses(addrinfo* result) {
 /**
  * @brief Prompt user for username with validation
  * @return User-entered username (1-20 printable ASCII characters)
+ * 
+ * Provides real-time character-by-character input with:
+ * - Backspace support
+ * - Length enforcement (20 characters max)
+ * - Printable ASCII validation (characters 32-127)
+ * - Empty username rejection
  */
 std::string get_username() {
     std::string username;
@@ -95,10 +93,10 @@ std::string get_username() {
         // if pressed enter, break
         if (ch == '\r') {
             if (!username.empty()) {
-                std::cout << std::endl;
+                std::cout << "\n";
                 break;
             }
-            std::cout << "\33[2K\r" << "Username cannot be empty." << std::endl;
+            std::cout << "\33[2K\r" << "Username cannot be empty." << "\n";
             std::cout << "Enter a username: " << std::flush;
         }
         // if backspace, backspace
@@ -161,12 +159,12 @@ int send_all(SOCKET sock, char* buf, int len) {
 
 /**
  * @brief Handle user input and message sending
- * @param sock Socket connected to server
+ * @param server_socket Socket connected to server
  * @param username Current user's username
  * @param current_input Shared string for current input line
  * 
- * Manages keyboard input, processes exit commands,
- * and sends messages to the server
+ * Manages keyboard input, processes special commands (/quit),
+ * and sends messages to the server. Runs until running becomes false.
  */
 void handle_user_input(SOCKET sock, std::string& username, std::string& current_input) {
         std::cout << username << ": " << std::flush;
@@ -185,8 +183,8 @@ void handle_user_input(SOCKET sock, std::string& username, std::string& current_
                 }
                 // handle quit command
                 if (message_copy == "/quit") {
-                    safe_shutdown(sock);
                     running = false;       
+                    safe_close_socket(sock);
                     break;
                 }
 
@@ -196,15 +194,15 @@ void handle_user_input(SOCKET sock, std::string& username, std::string& current_
 
                 if (bytes_sent != static_cast<int>(message_to_send.size())) {
                     printf("Error sending message: %d\n", WSAGetLastError());
-                    safe_shutdown(sock);
                     running = false;
+                    safe_close_socket(sock);
                     break; 
                 }
 
                 // display new input prompt
                 {
                     std::lock_guard<std::mutex> write_lock(input_mutex);
-                    std::cout << std::endl;
+                    std::cout << "\n";
                     std::cout << username << ": " << std::flush;
                 }
             }
@@ -240,9 +238,7 @@ int recv_all(SOCKET sock, char* buf, int len) {
     int total = 0;
     while (total < len) {
         int n = recv(sock, buf + total, len - total, 0);
-        if (n <= 0) {
-            return (total == 0) ? n : total; 
-        }
+        if (n <= 0) return (total == 0) ? n : total;
         total += n;
     }
     return total;
@@ -250,21 +246,26 @@ int recv_all(SOCKET sock, char* buf, int len) {
 
 /**
  * @brief Handle incoming messages from server
- * @param sock Socket connected to server
+ * @param server_socket Socket connected to server
  * @param username Current user's username
  * @param current_input Shared string for current input line
  * 
  * Continuously receives messages from the server and displays them
- * while preserving the current input prompt. 
+ * while preserving the current input prompt. Validates message size
+ * and handles disconnection.
  */
 void handle_recv(SOCKET sock, std::string& username, std::string& current_input ) {
         while (running) {
 
             // read message length header
             uint32_t len_net;
-            if (recv_all(sock, reinterpret_cast<char*>(&len_net), sizeof(len_net)) <= 0) {
-                safe_shutdown(sock);
+            if (recv_all(sock, reinterpret_cast<char*>(&len_net), sizeof(len_net)) <= 0) {            
+                {
+                    std::lock_guard<std::mutex> lock(input_mutex);
+                    std::cout << "\n" << "----- [Disconnected] -----" << "\n";
+                }
                 running = false;
+                safe_close_socket(sock);
                 break;
             }
 
@@ -272,16 +273,20 @@ void handle_recv(SOCKET sock, std::string& username, std::string& current_input 
 
             if (len == 0 || len > 1024) {
                 printf("Warning: server sent invalid message size (%u bytes).\n", len);
-                safe_shutdown(sock);
                 running = false;
+                safe_close_socket(sock);
                 break;
             }
             
             // read message payload
             std::string message(len, '\0');
             if (recv_all(sock, message.data(), len) <= 0) {
-                safe_shutdown(sock);
+                {
+                    std::lock_guard<std::mutex> lock(input_mutex);
+                    std::cout << "\n" << "----- [Disconnected] -----" << "\n";
+                }
                 running = false;
+                safe_close_socket(sock);
                 break;
             }
 
@@ -291,22 +296,21 @@ void handle_recv(SOCKET sock, std::string& username, std::string& current_input 
                 std::string current_input_copy = current_input; 
 
                 // clear line, display message, restore input prompt
-                std::cout << "\33[2K\r" << message << std::endl
+                std::cout << "\33[2K\r" << message << "\n"
                     << username << ": " << current_input_copy << std::flush;
             }
         }
     }
 
 
-
 int main(int argc, char* argv[]) {
 
 
-    std::cout << "yo" << std::endl;
+    std::cout << "yo" << "\n";
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <server_address>" << std::endl;
-        std::cerr << "Example: " << argv[0] << " 127.0.0.1" << std::endl;
-        std::cerr << "Example: " << argv[0] << " example.com" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <server_address>" << "\n";
+        std::cerr << "Example: " << argv[0] << " 127.0.0.1" << "\n";
+        std::cerr << "Example: " << argv[0] << " example.com" << "\n";
         return 1;
     }
 
@@ -369,8 +373,10 @@ int main(int argc, char* argv[]) {
     input_thread.join();
     receiver_thread.join();
 
-    std::cout << std::endl;
-    std::cout << "Quitting..." << std::endl;
+    std::cout << "\n";
+    std::cout << "Quitting..." << "\n";
+
+
 
     WSACleanup();
     return 0;

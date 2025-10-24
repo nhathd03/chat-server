@@ -10,22 +10,20 @@
 #include <vector>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <memory>
+#include <signal.h>
+
 
 #pragma comment(lib, "Ws2_32.lib")
-
-namespace config {
-    constexpr const char* DEFAULT_PORT = "3000";
-    constexpr int BACKLOG_SIZE = SOMAXCONN;
-    constexpr size_t MAX_MESSAGE_SIZE = 1024; // safety limit
-}
-
+constexpr const char* DEFAULT_PORT = "3000";
 
 struct client_info {
     SOCKET socket;
     std::string name;
 };
 
-std::vector<client_info> clients_list;
+std::vector<std::shared_ptr<client_info>> clients_list;
 std::shared_mutex client_mutex;
 std::atomic<bool> running = true;
 
@@ -49,24 +47,18 @@ inline std::vector<char> build_message_buffer(const std::string& payload) {
 }
 
 /**
- * @brief Receives exactly the specified number of bytes from a socket
- * 
- * Handles partial receives by looping until all data is received or an error occurs.
- * 
+ * @brief Receive exact number of bytes, handling partial receives
  * @param sock Socket to receive from
  * @param buf Buffer to store received data
  * @param len Number of bytes to receive
- * @return Number of bytes received, or <=0 on error/close.
+ * @return Total bytes received, or <= 0 on error/disconnect
  *         
- *         
- */
+ */    
 int recv_all(SOCKET sock, char* buf, int len) {
     int total = 0;
     while (total < len) {
         int n = recv(sock, buf + total, len - total, 0);
-        if (n <= 0) {
-            return (total == 0) ? n : total; 
-        }
+        if (n <= 0) return (total == 0) ? n : total;
         total += n;
     }
     return total;
@@ -89,8 +81,8 @@ bool receive_message(SOCKET client_socket, std::string& out_message) {
     
     const uint32_t message_length = ntohl(length_network);
     
-    if (message_length == 0 || message_length > config::MAX_MESSAGE_SIZE) {
-        std::cerr << "Invalid message length: " << message_length << std::endl;
+    if (message_length == 0 || message_length > 1024) {
+        std::cerr << "Invalid message length: " << message_length << "\n";
         return false;
     }
     
@@ -100,6 +92,7 @@ bool receive_message(SOCKET client_socket, std::string& out_message) {
     
     return bytes_received == static_cast<int>(message_length);
 }
+
 
 
 /**
@@ -133,41 +126,21 @@ int send_all(SOCKET sock, const char* buf, int len) {
  * 
  * Automatically removes clients that fail to receive the message.
  * 
- * @param output_sock Socket of the client who sent the message (excluded from broadcast)
- * @param message_to_send Buffer containing the complete message to send
- * @param len Length of the message buffer
+ * @param sock Socket of the client who sent the message (excluded from broadcast)
+ * @param message Buffer containing the complete message to send
+ * @param message_length Length of the message buffer
  */
-void broadcast_message(SOCKET output_sock, char* message_to_send, int len) {
-    std::vector<SOCKET> disconnected_clients;
-
+void broadcast_message(SOCKET sock, char* message_to_send, int len) {
     // send message to all clients on the list
     {
         std::shared_lock<std::shared_mutex> read_lock(client_mutex);
-        for (client_info& c : clients_list) {
-            if (c.socket != output_sock) {
-                int result = send_all(c.socket, message_to_send, len);
-
-                // if socket error, add client on list to remove
-                if (result == SOCKET_ERROR) {
-                    disconnected_clients.push_back(c.socket);
-                } 
+        for (const std::shared_ptr<client_info>& c : clients_list) {
+            if (c->socket != sock) {
+                int result = send_all(c->socket, message_to_send, len);
+                if (result < 0 || result != len) {
+                     std::cout << "Error sending message to " << c->socket << "\n"; 
+                }
             }
-        }
-    }
-
-    // remove all disconnected clients 
-    if (!disconnected_clients.empty()) {
-        std::unique_lock<std::shared_mutex> write_lock(client_mutex);
-        for (SOCKET client : disconnected_clients) {
-
-            shutdown(client, SD_BOTH);
-            closesocket(client);
-
-            clients_list.erase(
-                std::remove_if(clients_list.begin(), clients_list.end(),
-                    [&](const client_info& c){ return c.socket == client; }),
-                clients_list.end()
-            );
         }
     }
 }
@@ -176,55 +149,61 @@ void broadcast_message(SOCKET output_sock, char* message_to_send, int len) {
  * @brief Receives a length-prefixed message from a client
  * @param client client info struct, including the client username, and socket to connect to
  */
-void handle_client(client_info client) {
+void handle_client(std::shared_ptr<client_info> client) {
 
     // Send welcome message to all clients
-    std::string welcome_message = client.name + " has joined the chat.";
+    std::string welcome_message = client->name + "----- has joined the chat. -----";
     std::vector<char> welcome_message_to_send = build_message_buffer(welcome_message);
 
-    broadcast_message(client.socket, welcome_message_to_send.data(), welcome_message_to_send.size());
+    broadcast_message(client->socket, welcome_message_to_send.data(), welcome_message_to_send.size());
 
-    std::cout << "[JOIN] " << client.name << " connected" << std::endl;
+    std::cout << "[JOIN] " << client->name << " connected" << "\n";
 
     // constantly listen for oncoming messages from the client
     std::string incoming_message;
     while (running) {
-        if (!receive_message(client.socket, incoming_message)) break;
+        if (!receive_message(client->socket, incoming_message)) {
+            // notify other clients on exit
+            std::string exit_message = client->name + " has left the chat.";
+            std::vector<char> exit_message_to_send = build_message_buffer(exit_message);
+
+            broadcast_message(client->socket, exit_message_to_send.data(), exit_message_to_send.size());
+
+            break;
+        };
 
         // broadcast message to other clients
-        std::string outgoing_message = client.name + ": " + incoming_message;
+        std::string outgoing_message = client->name + ": " + incoming_message;
         std::vector<char> message_to_send = build_message_buffer(outgoing_message);
 
-        broadcast_message(client.socket, message_to_send.data(), message_to_send.size());
+        broadcast_message(client->socket, message_to_send.data(), message_to_send.size());
     }
 
-    // notify other clients on exit
-    std::string exit_message = client.name + " has left the chat.";
-    std::vector<char> exit_message_to_send = build_message_buffer(exit_message);
-
-    broadcast_message(client.socket, exit_message_to_send.data(), exit_message_to_send.size());
-
-    std::cout << "[LEAVE] " << client.name << " disconnected" << std::endl;
+    std::cout << "[LEAVE] " << client->name << " disconnected" << "\n";
 
     // Clean up
     {
         std::unique_lock<std::shared_mutex> write_lock(client_mutex);
-        clients_list.erase(
-            std::remove_if(clients_list.begin(), clients_list.end(),
-                [&](const client_info& c){ return c.socket == client.socket; }),
-            clients_list.end()
-        );
+         auto it = std::find_if(clients_list.begin(), clients_list.end(), 
+                [&](const std::shared_ptr<client_info>& c) {
+                    return (c->socket == client->socket);
+                }      
+            );
+        
+        if (it != clients_list.end()) {
+            clients_list.erase(it);
+        }
+
     }
     
-    shutdown(client.socket, SD_BOTH);
-    closesocket(client.socket);  
+    shutdown(client->socket, SD_BOTH);
+    closesocket(client->socket);  
 }
 
 /**
  * @brief Creates a listening socket + binds ip and port 
  * @param port Port to connect to, inputted by the user
  */
-
 SOCKET create_listening_socket(const char* port) {
     addrinfo hints{};
 
@@ -238,7 +217,7 @@ SOCKET create_listening_socket(const char* port) {
     const int result = getaddrinfo(nullptr, port, &hints, &address_info);
     
     if (result != 0) {
-        std::cerr << "getaddrinfo failed: " << result << std::endl;
+        std::cerr << "getaddrinfo failed: " << result << "\n";
         return INVALID_SOCKET;
     }
     
@@ -249,20 +228,20 @@ SOCKET create_listening_socket(const char* port) {
     SOCKET listen_socket = socket(address_info->ai_family, address_info->ai_socktype, address_info->ai_protocol);
     
     if (listen_socket == INVALID_SOCKET) {
-        std::cerr << "socket creation failed: " << WSAGetLastError() << std::endl;
+        std::cerr << "socket creation failed: " << WSAGetLastError() << "\n";
         return INVALID_SOCKET;
     }
     
     // Bind socket
     if (bind(listen_socket, address_info->ai_addr, static_cast<int>(address_info->ai_addrlen)) == SOCKET_ERROR) {
-        std::cerr << "bind failed: " << WSAGetLastError() << std::endl;
+        std::cerr << "bind failed: " << WSAGetLastError() << "\n";
         closesocket(listen_socket);
         return INVALID_SOCKET;
     }
     
     // Listen for connections
-    if (listen(listen_socket, config::BACKLOG_SIZE) == SOCKET_ERROR) {
-        std::cerr << "listen failed: " << WSAGetLastError() << std::endl;
+    if (listen(listen_socket, SOMAXCONN) == SOCKET_ERROR) {
+        std::cerr << "listen failed: " << WSAGetLastError() << "\n";
         closesocket(listen_socket);
         return INVALID_SOCKET;
     }
@@ -270,12 +249,19 @@ SOCKET create_listening_socket(const char* port) {
     return listen_socket;
 }
 
+// signal handler
+void signal_handler(int) {
+    running = false;
+}
+
+
+
 int main() {
     WSADATA wsa_data;
 
     int i_result;
     
-    std::cout << "yo" << std::endl;
+    std::cout << "yo" << "\n";
 
     // Initialize Winsock
     i_result = WSAStartup(MAKEWORD(2,2), &wsa_data);
@@ -285,20 +271,29 @@ int main() {
         return 1;                        
     }
     
-    std::cout << "Chat Server v1.0" << std::endl;
-    std::cout << "Initializing..." << std::endl;
+    std::cout << "Chat Server v1.0" << "\n";
+    std::cout << "Initializing..." << "\n";
 
     // create listening socket
-    const SOCKET listen_socket = create_listening_socket(config::DEFAULT_PORT);
-
+    const SOCKET listen_socket = create_listening_socket(DEFAULT_PORT);
+ 
     if (listen_socket == INVALID_SOCKET) {
         WSACleanup();
         return 1;
     }
     
+    u_long mode = 1;  // 1 = non-blocking, 0 = blocking
+    if (ioctlsocket(listen_socket, FIONBIO, &mode) == SOCKET_ERROR) {
+        std::cerr << "Failed to set non-blocking mode: " << WSAGetLastError() << "\n";
+        closesocket(listen_socket);
+        WSACleanup();
+        return 1;
+    }
 
-    std::cout << "Server listening on port " << config::DEFAULT_PORT << std::endl;
-    std::cout << "Waiting for connections..." << std::endl;
+    std::cout << "Server listening on port " << DEFAULT_PORT << "\n";
+    std::cout << "Waiting for connections..." << "\n";
+
+    signal(SIGINT, signal_handler);
 
     // constantly listen for a connection
     while (running) {
@@ -306,25 +301,44 @@ int main() {
         // Accept a client socket
         SOCKET client_socket = accept(listen_socket, NULL, NULL);
         if (client_socket == INVALID_SOCKET) {
-            printf("accept failed: %d\n", WSAGetLastError());
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                // No pending connections, sleep briefly and check running flag
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            std::cerr << "accept failed: " << err << "\n";
             continue;
+        }
+
+        u_long blocking = 0;
+        if(ioctlsocket(client_socket, FIONBIO, &blocking) == SOCKET_ERROR) {
+            std::cerr << "Failed to set blocking mode: " << WSAGetLastError() << "\n";
+            closesocket(listen_socket);
+            WSACleanup();
+            return 1;
         }
 
         // Receiving the client's name:
         // grab length of name
-        int32_t len_net;
+        uint32_t len_net;
         if (recv_all(client_socket, reinterpret_cast<char*>(&len_net), sizeof(len_net)) <= 0) {
-            printf("Error receiving message name: 1\n", WSAGetLastError());
+            printf("Error receiving message name: 1 %d\n", WSAGetLastError());
             closesocket(client_socket);
             continue;
         };
         
         // use length to build name buffer
-        int32_t name_len = ntohl(len_net);
+        uint32_t name_len = ntohl(len_net);
+        if (name_len <= 0 || name_len > 20) { 
+            std::cerr << "Invalid name length: " << name_len << "\n";
+            closesocket(client_socket);
+            continue;
+        }
         std::string name(name_len, '\0');
 
         if (recv_all(client_socket, &name[0], name_len) <= 0) {
-            printf("Error receiving message name: 2\n", WSAGetLastError());
+            printf("Error receiving message name: 2 %d\n", WSAGetLastError());
             closesocket(client_socket);
             continue;
         };
@@ -332,7 +346,7 @@ int main() {
         // get client IP and log in terminal
         sockaddr_in client_addr;
         int addr_len = sizeof(client_addr);
-        getpeername(client_socket, (sockaddr*)&client_addr, &addr_len);
+        getpeername(client_socket, (sockaddr*)&client_addr, &addr_len);              
 
         char client_ip[INET_ADDRSTRLEN]; // 16 bytes
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
@@ -341,25 +355,45 @@ int main() {
 
         // add new client to the list and create a thread for it
         {
-            std::unique_lock<std::shared_mutex> write_lock(client_mutex);
+             std::unique_lock<std::shared_mutex> write_lock(client_mutex);
 
-            client_info new_client = {
-                client_socket,
-                name
-            };
+            if (clients_list.size() < 10) {
+                auto new_client = std::make_shared<client_info>(client_info{
+                        client_socket,
+                        name
+                    });
 
-            clients_list.push_back(new_client);
-            std::thread t(handle_client, new_client);
-            t.detach();
+                clients_list.push_back(new_client);
+                std::thread t(handle_client, new_client);
+                t.detach();
+            }  else {
+                std::cerr << "Server full, rejecting client: " << name << "\n";
+                closesocket(client_socket);
+            }
         }
     }
-   
-    // clean up
+
+    std::cout << "Server shutting down..." << "\n";
+
+    // Wait for client threads to finish
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    // Force close all remaining clients
+    {
+        std::unique_lock<std::shared_mutex> lock(client_mutex);
+        for (auto& client : clients_list) {
+            shutdown(client->socket, SD_BOTH);
+            closesocket(client->socket);
+        }
+        clients_list.clear();
+    }
+
+    // Clean up listening socket
     shutdown(listen_socket, SD_BOTH);
     closesocket(listen_socket);
     WSACleanup();
 
-    std::cout << "yo" << std::endl;
+    std::cout << "Server stopped.";
     
     return 0;
 }
